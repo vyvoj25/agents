@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import base64
+import dataclasses
 import uuid
+import threading
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal
 
@@ -58,7 +63,7 @@ class RealtimeModel(llm.RealtimeModel):
                 message_truncation=False,
                 turn_detection=True,          # handled by ElevenLabs VAD/barge-in
                 user_transcription=True,       # transcription events provided by SDK
-                auto_tool_reply_generation=False,
+                auto_tool_reply_generation=True,
                 audio_output=("audio" in modalities_val),
             )
         )
@@ -109,6 +114,7 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         # Active generation state (created lazily on first agent output)
         self._gen_audio_q: asyncio.Queue[rtc.AudioFrame] | None = None
         self._gen_text_q: asyncio.Queue[str] | None = None
+        self._gen_func_q: asyncio.Queue[llm.FunctionCall] | None = None
         self._gen_close_sent = False
         self._gen_idle_handle: asyncio.TimerHandle | None = None
         self._gen_idle_timeout_s = 0.8  # close generation after idle
@@ -118,6 +124,10 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         # Client tools bridging ElevenLabs <-> LiveKit
         self._client_tools = None  # created at start
         self._registered_tool_names: set[str] = set()
+        # Pending tool results (bridge FunctionCall -> FunctionCallOutput)
+        self._pending_tool_results: dict[str, concurrent.futures.Future[Any]] = {}
+        self._pending_tool_lock = threading.Lock()
+        self._tool_timeout_s: float = 30.0
         # Conversation initiation data (can be updated before session starts)
         self._init_dynamic_vars: dict[str, Any] | None = (
             realtime_model._opts.dynamic_variables.copy() if realtime_model._opts.dynamic_variables else None
@@ -147,6 +157,29 @@ class RealtimeSession(llm.RealtimeSession[Any]):
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         self._chat_ctx = chat_ctx.copy()
         logger.debug("chat_ctx updated: %d items", len(self._chat_ctx.items))
+
+        # Bridge: resolve pending tool results when FunctionCallOutput arrives from AgentActivity
+        try:
+            for item in self._chat_ctx.items:
+                if isinstance(item, llm.FunctionCallOutput):
+                    call_id = item.call_id
+                    fut: concurrent.futures.Future[Any] | None = None
+                    with self._pending_tool_lock:
+                        fut = self._pending_tool_results.pop(call_id, None)
+                    if fut is not None and not fut.done():
+                        # parse JSON output back to Python object when possible
+                        parsed: Any
+                        try:
+                            parsed = json.loads(item.output)
+                        except Exception:
+                            parsed = item.output
+
+                        if item.is_error:
+                            fut.set_exception(RuntimeError(str(parsed)))
+                        else:
+                            fut.set_result(parsed)
+        except Exception:
+            logger.exception("failed to resolve pending tool results from chat_ctx")
 
     async def update_tools(self, tools: list[llm.FunctionTool | llm.RawFunctionTool | Any]) -> None:
         self._tools = llm.ToolContext(tools)
@@ -417,141 +450,82 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                 return {}
             return {k: v for k, v in p.items() if k not in RESERVED_KEYS}
 
-        is_async = asyncio.iscoroutinefunction(tool)
+        def _to_json_safe(obj: Any) -> Any:
+            try:
+                json.dumps(obj)
+                return obj
+            except TypeError:
+                pass
+
+            # dataclasses -> dict
+            if dataclasses.is_dataclass(obj):
+                return _to_json_safe(dataclasses.asdict(obj))
+
+            # pydantic models / similar
+            if hasattr(obj, "model_dump"):
+                try:
+                    return _to_json_safe(obj.model_dump())
+                except Exception:
+                    pass
+
+            # containers
+            if isinstance(obj, dict):
+                return {str(k): _to_json_safe(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple, set)):
+                return [_to_json_safe(v) for v in obj]
+
+            # bytes -> utf-8 or base64 string
+            if isinstance(obj, bytes):
+                try:
+                    return obj.decode("utf-8")
+                except Exception:
+                    return base64.b64encode(obj).decode("ascii")
+
+            # primitives or fallback to str
+            if isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            return str(obj)
 
         def _call_tool_sync(params: dict[str, Any]) -> Any:
+            # NOTE: We do NOT execute the tool here. We bridge the provider's tool call
+            # to LiveKit's AgentActivity by emitting a FunctionCall into the function stream
+            # and then blocking until the corresponding FunctionCallOutput is provided via
+            # update_chat_ctx(). This preserves the canonical RunContext injection path.
             clean = _sanitize(params)
-            logger.debug("client tool '%s' invoked (%s) with params: %s", tool_name, "async" if is_async else "sync", clean)
+            logger.debug("client tool '%s' invoked with params: %s", tool_name, clean)
+            # Determine call id from params or generate one
+            call_id = str(params.get("tool_call_id") or uuid.uuid4())
+
             try:
-                import inspect
+                # Emit FunctionCall into the generation function stream
+                self._ensure_generation_open(modalities=["text"])  # type: ignore[arg-type]
+                if self._gen_func_q is not None:
+                    fnc = llm.FunctionCall(
+                        call_id=call_id,
+                        name=tool_name,
+                        arguments=json.dumps(clean),
+                    )
+                    self._loop.call_soon_threadsafe(self._gen_func_q.put_nowait, fnc)
+                else:
+                    logger.warning("function queue is not available when invoking tool '%s'", tool_name)
 
-                def _call_kwargs() -> Any:
-                    # Try kwargs directly
-                    return tool(**clean)
+                # Wait for the corresponding FunctionCallOutput delivered via update_chat_ctx
+                fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+                with self._pending_tool_lock:
+                    self._pending_tool_results[call_id] = fut
 
-                def _call_single_named_dict(param_name: str) -> Any:
-                    return tool(**{param_name: clean})
-
-                def _call_positional_dict() -> Any:
-                    return tool(clean)
-
-                # Prefer kwargs when signature can accept them
-                sig = inspect.signature(tool)
-                params_list = [p for p in sig.parameters.values() if p.name != "self"]
-                has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params_list)
-                # Determine if all provided keys are acceptable as kwargs
-                acceptable_kw_names = {p.name for p in params_list if p.kind in (
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )}
-                can_use_kwargs = has_var_kw or all(k in acceptable_kw_names for k in clean.keys())
-
-                # Try kwargs path first if feasible
-                if can_use_kwargs:
-                    try:
-                        if is_async:
-                            coro = _call_kwargs()
-                            fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-                            result = fut.result()
-                        else:
-                            result = _call_kwargs()
-                        logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                        return result
-                    except TypeError as e:
-                        logger.debug("kwargs call failed for tool '%s': %s", tool_name, e)
-
-                # Next, try mixed binding: positional in declared order + keyword-only
                 try:
-                    used_keys: set[str] = set()
-                    args_list: list[Any] = []
-                    kw_only: dict[str, Any] = {}
-                    for p in params_list:
-                        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                            if p.name in clean:
-                                args_list.append(clean[p.name])
-                                used_keys.add(p.name)
-                        elif p.kind is inspect.Parameter.KEYWORD_ONLY:
-                            if p.name in clean:
-                                kw_only[p.name] = clean[p.name]
-                                used_keys.add(p.name)
-
-                    # Remaining keys go into kwargs only if **kwargs is accepted
-                    remaining = {k: v for k, v in clean.items() if k not in used_keys}
-                    if has_var_kw:
-                        kw_all = {**kw_only, **remaining}
-                    else:
-                        kw_all = kw_only
-
-                    if is_async:
-                        coro = tool(*args_list, **kw_all)
-                        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-                        result = fut.result()
-                    else:
-                        result = tool(*args_list, **kw_all)
-                    logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                    return result
-                except TypeError as e:
-                    logger.debug("pos+kw binding failed for tool '%s': %s", tool_name, e)
-
-                # Next, try passing the entire dict to a single named parameter
-                # If there is exactly one non-self parameter, use its name
-                non_self_params = [p for p in params_list if p.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )]
-                tried_param_names: set[str] = set()
-                if len(non_self_params) == 1:
-                    pname = non_self_params[0].name
-                    tried_param_names.add(pname)
-                    try:
-                        if is_async:
-                            coro = _call_single_named_dict(pname)
-                            fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-                            result = fut.result()
-                        else:
-                            result = _call_single_named_dict(pname)
-                        logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                        return result
-                    except TypeError as e:
-                        logger.debug("single-dict param '%s' failed for tool '%s': %s", pname, tool_name, e)
-
-                # Try common parameter names
-                for pname in ("parameters", "params", "payload", "data"):
-                    if pname in tried_param_names:
-                        continue
-                    try:
-                        if is_async:
-                            coro = _call_single_named_dict(pname)
-                            fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-                            result = fut.result()
-                        else:
-                            result = _call_single_named_dict(pname)
-                        logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                        return result
-                    except TypeError:
-                        continue
-
-                # Finally, as a last resort, pass as positional dict only if the function allows positional args
-                allows_positional = any(p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                                        for p in params_list)
-                if allows_positional:
-                    if is_async:
-                        coro = _call_positional_dict()
-                        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-                        result = fut.result()
-                    else:
-                        result = _call_positional_dict()
-                    logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                    return result
-
-                # Give up with a clear error
-                raise TypeError(f"unable to bind client tool '{tool_name}' with provided parameters: {list(clean.keys())}")
-                logger.debug("client tool '%s' completed with result: %s", tool_name, result)
-                return result
+                    result_obj = fut.result(timeout=self._tool_timeout_s)
+                    logger.debug("client tool '%s' completed with bridged result: %s", tool_name, result_obj)
+                    return result_obj
+                except concurrent.futures.TimeoutError:
+                    with self._pending_tool_lock:
+                        self._pending_tool_results.pop(call_id, None)
+                    logger.error("tool '%s' timed out waiting for result (call_id=%s)", tool_name, call_id)
+                    return {"error": "tool execution timed out"}
             except Exception:
-                logger.exception("client tool '%s' raised an exception", tool_name)
-                raise
+                logger.exception("error while bridging tool '%s' invocation", tool_name)
+                return {"error": "tool bridging failed"}
 
         return _call_tool_sync
 
@@ -596,11 +570,12 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         self._close_active_generation()
 
     def _ensure_generation_open(self, *, modalities: list[str]) -> None:
-        if self._gen_audio_q is not None and self._gen_text_q is not None:
+        if self._gen_audio_q is not None and self._gen_text_q is not None and self._gen_func_q is not None:
             return
 
         self._gen_audio_q = asyncio.Queue()
         self._gen_text_q = asyncio.Queue()
+        self._gen_func_q = asyncio.Queue()
         self._gen_close_sent = False
 
         msg_id = str(uuid.uuid4())
@@ -621,6 +596,14 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                     break
                 yield item
 
+        async def _func_iter():
+            assert self._gen_func_q is not None
+            while True:
+                item = await self._gen_func_q.get()
+                if item is None:  # type: ignore[comparison-overlap]
+                    break
+                yield item
+
         async def _modalities() -> list[Literal["text", "audio"]]:
             # If we received any text, both will be present; otherwise audio-only
             return [m for m in ["text" if "text" in modalities else None, "audio"] if m]  # type: ignore[list-item]
@@ -633,15 +616,15 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                 modalities=_modalities(),
             )
 
-        async def _empty_func_stream():
-            if False:
-                yield None  # pragma: no cover
+        async def _function_stream():
+            async for fc in _func_iter():
+                yield fc
 
         def _emit_generation_created_on_loop():
             # Build the event on the loop thread and emit
             generation_ev = llm.GenerationCreatedEvent(
                 message_stream=_one_message(),
-                function_stream=_empty_func_stream(),
+                function_stream=_function_stream(),
                 user_initiated=False,
             )
             # Resolve any pending generate_reply future
@@ -663,12 +646,16 @@ class RealtimeSession(llm.RealtimeSession[Any]):
             self._loop.call_soon_threadsafe(self._gen_audio_q.put_nowait, None)  # type: ignore[arg-type]
         if self._gen_text_q is not None:
             self._loop.call_soon_threadsafe(self._gen_text_q.put_nowait, None)  # type: ignore[arg-type]
+        if self._gen_func_q is not None:
+            self._loop.call_soon_threadsafe(self._gen_func_q.put_nowait, None)  # type: ignore[arg-type]
         # Allow future generations to open
         self._gen_audio_q = None
         self._gen_text_q = None
+        self._gen_func_q = None
         # Reset for next generation
         self._gen_audio_q = None
         self._gen_text_q = None
+        self._gen_func_q = None
         self._gen_close_sent = False
 
 
