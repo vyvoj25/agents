@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import ast
 import base64
 import dataclasses
 import uuid
+import time
+import os
 import threading
 import concurrent.futures
 from dataclasses import dataclass
@@ -127,7 +130,24 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         # Pending tool results (bridge FunctionCall -> FunctionCallOutput)
         self._pending_tool_results: dict[str, concurrent.futures.Future[Any]] = {}
         self._pending_tool_lock = threading.Lock()
-        self._tool_timeout_s: float = 30.0
+        # Primary timeout for tool bridging; configurable via env
+        self._tool_timeout_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_S", "45.0"))
+        # Extra grace for near-deadline results (helps avoid races)
+        self._tool_timeout_grace_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_GRACE_S", "3.0"))
+        # Dedup maps to coalesce duplicate invocations while one is in-flight
+        # key -> call_id, where key = f"{tool}:{json.dumps(sorted params)}"
+        self._pending_tool_by_key: dict[str, str] = {}
+        # call_id -> key (for cleanup on resolution)
+        self._call_id_to_key: dict[str, str] = {}
+        # call_id -> perf_counter() timestamp when invocation was emitted
+        self._tool_call_start_ts: dict[str, float] = {}
+        # feature toggle: deduplicate identical tool invocations while one is in-flight
+        self._dedup_enable: bool = os.getenv("LIVEKIT_ELEVENLABS_DEDUP_TOOLS", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         # Conversation initiation data (can be updated before session starts)
         self._init_dynamic_vars: dict[str, Any] | None = (
             realtime_model._opts.dynamic_variables.copy() if realtime_model._opts.dynamic_variables else None
@@ -166,18 +186,50 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                     fut: concurrent.futures.Future[Any] | None = None
                     with self._pending_tool_lock:
                         fut = self._pending_tool_results.pop(call_id, None)
-                    if fut is not None and not fut.done():
+                        key = self._call_id_to_key.pop(call_id, None)
+                        if key is not None:
+                            self._pending_tool_by_key.pop(key, None)
+                        started = self._tool_call_start_ts.pop(call_id, None)
+                    if fut is None:
+                        logger.debug(
+                            "late tool result arrived with no pending waiter (call_id=%s, is_error=%s)",
+                            call_id,
+                            getattr(item, "is_error", None),
+                        )
+                        continue
+                    if not fut.done():
                         # parse JSON output back to Python object when possible
                         parsed: Any
                         try:
                             parsed = json.loads(item.output)
                         except Exception:
-                            parsed = item.output
+                            # try to parse python-literal-like strings (e.g. "{'k': 'v'}")
+                            try:
+                                literal = ast.literal_eval(item.output)
+                                # ensure it's JSON-serializable
+                                json.dumps(literal)
+                                parsed = literal
+                            except Exception:
+                                parsed = item.output
 
                         if item.is_error:
                             fut.set_exception(RuntimeError(str(parsed)))
                         else:
                             fut.set_result(parsed)
+                        try:
+                            latency_ms = None
+                            if started is not None:
+                                latency_ms = int((time.perf_counter() - started) * 1000)
+                            logger.debug(
+                                "resolved tool result (call_id=%s, is_error=%s, latency_ms=%s): %s",
+                                call_id,
+                                item.is_error,
+                                latency_ms,
+                                parsed,
+                            )
+                        except Exception:
+                            # ensure logging doesn't break resolution flow
+                            pass
         except Exception:
             logger.exception("failed to resolve pending tool results from chat_ctx")
 
@@ -492,11 +544,94 @@ class RealtimeSession(llm.RealtimeSession[Any]):
             # and then blocking until the corresponding FunctionCallOutput is provided via
             # update_chat_ctx(). This preserves the canonical RunContext injection path.
             clean = _sanitize(params)
-            logger.debug("client tool '%s' invoked with params: %s", tool_name, clean)
             # Determine call id from params or generate one
             call_id = str(params.get("tool_call_id") or uuid.uuid4())
+            # Build a dedup key from tool name and canonicalized params
+            try:
+                dedup_key = f"{tool_name}:{json.dumps(clean, sort_keys=True, separators=(',', ':'))}"
+            except Exception:
+                # fallback if params are not JSON serializable; use str()
+                dedup_key = f"{tool_name}:{str(clean)}"
+            logger.debug(
+                "client tool '%s' invoked (call_id=%s) with params: %s", tool_name, call_id, clean
+            )
 
             try:
+                # Check for an in-flight identical invocation and coalesce if found
+                if self._dedup_enable:
+                    with self._pending_tool_lock:
+                        existing_call_id = self._pending_tool_by_key.get(dedup_key)
+                        existing_fut = (
+                            self._pending_tool_results.get(existing_call_id)
+                            if existing_call_id is not None
+                            else None
+                        )
+                        existing_started = (
+                            self._tool_call_start_ts.get(existing_call_id)
+                            if existing_call_id is not None
+                            else None
+                        )
+                        if existing_fut is not None and not existing_fut.done():
+                            logger.debug(
+                                "coalescing duplicate tool '%s' (call_id=%s) into existing (call_id=%s)",
+                                tool_name,
+                                call_id,
+                                existing_call_id,
+                            )
+                            try:
+                                # use remaining time budget from the original call start
+                                remaining = self._tool_timeout_s
+                                if existing_started is not None:
+                                    elapsed = time.perf_counter() - existing_started
+                                    remaining = max(0.1, self._tool_timeout_s - elapsed)
+                                result_obj = existing_fut.result(timeout=remaining)
+                                # ensure JSON-safety for provider
+                                result_obj = _to_json_safe(result_obj)
+                                logger.debug(
+                                    "duplicate tool '%s' returning bridged result from existing (call_id=%s)",
+                                    tool_name,
+                                    existing_call_id,
+                                )
+                                return result_obj
+                            except Exception as e:
+                                # Any error propagated from the original call
+                                logger.error(
+                                    "duplicate tool '%s' bridged error from existing (call_id=%s): %s",
+                                    tool_name,
+                                    existing_call_id,
+                                    e,
+                                )
+                                return {"error": str(e), "call_id": existing_call_id}
+                            except concurrent.futures.TimeoutError:
+                                # final grace window to catch very late resolutions
+                                try:
+                                    result_obj = existing_fut.result(timeout=self._tool_timeout_grace_s)
+                                    result_obj = _to_json_safe(result_obj)
+                                    logger.debug(
+                                        "duplicate tool '%s' received result in grace window (call_id=%s)",
+                                        tool_name,
+                                        existing_call_id,
+                                    )
+                                    return result_obj
+                                except Exception as e:
+                                    logger.error(
+                                        "duplicate tool '%s' bridged error in grace window (call_id=%s): %s",
+                                        tool_name,
+                                        existing_call_id,
+                                        e,
+                                    )
+                                    return {"error": str(e), "call_id": existing_call_id}
+                                except concurrent.futures.TimeoutError:
+                                    logger.error(
+                                        "duplicate tool '%s' timed out waiting for existing result (call_id=%s)",
+                                        tool_name,
+                                        existing_call_id,
+                                    )
+                                    return {"error": "tool execution timed out"}
+                        elif existing_call_id is not None:
+                            # stale mapping; clean it up
+                            self._pending_tool_by_key.pop(dedup_key, None)
+
                 # Emit FunctionCall into the generation function stream
                 self._ensure_generation_open(modalities=["text"])  # type: ignore[arg-type]
                 if self._gen_func_q is not None:
@@ -513,18 +648,56 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                 fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
                 with self._pending_tool_lock:
                     self._pending_tool_results[call_id] = fut
+                    if self._dedup_enable:
+                        self._pending_tool_by_key[dedup_key] = call_id
+                        self._call_id_to_key[call_id] = dedup_key
+                    self._tool_call_start_ts[call_id] = time.perf_counter()
 
                 try:
                     result_obj = fut.result(timeout=self._tool_timeout_s)
-                    logger.debug("client tool '%s' completed with bridged result: %s", tool_name, result_obj)
+                    result_obj = _to_json_safe(result_obj)
+                    logger.debug(
+                        "client tool '%s' completed (call_id=%s) with bridged result: %s",
+                        tool_name,
+                        call_id,
+                        result_obj,
+                    )
                     return result_obj
+                except Exception as e:
+                    # Propagate structured error to provider instead of generic bridging failure
+                    logger.error(
+                        "client tool '%s' raised bridged error (call_id=%s): %s",
+                        tool_name,
+                        call_id,
+                        e,
+                    )
+                    return {"error": str(e), "call_id": call_id}
                 except concurrent.futures.TimeoutError:
+                    # give a small grace window to catch very late results
+                    try:
+                        result_obj = fut.result(timeout=self._tool_timeout_grace_s)
+                        result_obj = _to_json_safe(result_obj)
+                        logger.debug(
+                            "client tool '%s' received result in grace window (call_id=%s): %s",
+                            tool_name,
+                            call_id,
+                            result_obj,
+                        )
+                        return result_obj
+                    except concurrent.futures.TimeoutError:
+                        pass
                     with self._pending_tool_lock:
                         self._pending_tool_results.pop(call_id, None)
+                        key = self._call_id_to_key.pop(call_id, None)
+                        if key is not None:
+                            self._pending_tool_by_key.pop(key, None)
+                        self._tool_call_start_ts.pop(call_id, None)
                     logger.error("tool '%s' timed out waiting for result (call_id=%s)", tool_name, call_id)
                     return {"error": "tool execution timed out"}
             except Exception:
-                logger.exception("error while bridging tool '%s' invocation", tool_name)
+                logger.exception(
+                    "error while bridging tool '%s' invocation (call_id=%s)", tool_name, call_id
+                )
                 return {"error": "tool bridging failed"}
 
         return _call_tool_sync
