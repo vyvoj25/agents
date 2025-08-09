@@ -1,0 +1,28 @@
+{
+    "name": "LiveKit Agents Python",
+    "image": "mcr.microsoft.com/devcontainers/python:3.9",
+    "containerEnv": {
+        "PYTHONPATH": "${containerWorkspaceFolder}"
+    },
+    "runArgs": ["--name=livekit-agents-dev"],
+    "features": {
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.9"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "python.linting.enabled": true,
+                "python.linting.pylintEnabled": true
+            }
+        }
+    },
+    "postCreateCommand": "pip install 'livekit-agents[openai,google,elevenlabs]' python-dotenv",
+    "remoteUser": "vscode"
+}
