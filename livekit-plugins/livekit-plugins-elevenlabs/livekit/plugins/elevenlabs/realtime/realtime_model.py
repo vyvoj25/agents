@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import contextlib
 import json
 import ast
@@ -131,9 +132,9 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         self._pending_tool_results: dict[str, concurrent.futures.Future[Any]] = {}
         self._pending_tool_lock = threading.Lock()
         # Primary timeout for tool bridging; configurable via env
-        self._tool_timeout_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_S", "45.0"))
+        self._tool_timeout_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_S", "75.0"))
         # Extra grace for near-deadline results (helps avoid races)
-        self._tool_timeout_grace_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_GRACE_S", "3.0"))
+        self._tool_timeout_grace_s: float = float(os.getenv("LIVEKIT_ELEVENLABS_TOOL_TIMEOUT_GRACE_S", "8.0"))
         # Dedup maps to coalesce duplicate invocations while one is in-flight
         # key -> call_id, where key = f"{tool}:{json.dumps(sorted params)}"
         self._pending_tool_by_key: dict[str, str] = {}
@@ -593,15 +594,6 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                                     existing_call_id,
                                 )
                                 return result_obj
-                            except Exception as e:
-                                # Any error propagated from the original call
-                                logger.error(
-                                    "duplicate tool '%s' bridged error from existing (call_id=%s): %s",
-                                    tool_name,
-                                    existing_call_id,
-                                    e,
-                                )
-                                return {"error": str(e), "call_id": existing_call_id}
                             except concurrent.futures.TimeoutError:
                                 # final grace window to catch very late resolutions
                                 try:
@@ -620,19 +612,39 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                                         existing_call_id,
                                         e,
                                     )
-                                    return {"error": str(e), "call_id": existing_call_id}
+                                    return f"error: {str(e)} (call_id={existing_call_id})"
                                 except concurrent.futures.TimeoutError:
                                     logger.error(
                                         "duplicate tool '%s' timed out waiting for existing result (call_id=%s)",
                                         tool_name,
                                         existing_call_id,
                                     )
-                                    return {"error": "tool execution timed out"}
+                                    return "error: tool execution timed out"
+                            except Exception as e:
+                                # Any error propagated from the original call
+                                logger.error(
+                                    "duplicate tool '%s' bridged error from existing (call_id=%s): %s",
+                                    tool_name,
+                                    existing_call_id,
+                                    e,
+                                )
+                                return f"error: {str(e)} (call_id={existing_call_id})"
                         elif existing_call_id is not None:
                             # stale mapping; clean it up
                             self._pending_tool_by_key.pop(dedup_key, None)
 
-                # Emit FunctionCall into the generation function stream
+                # Prepare waiter BEFORE emitting the FunctionCall to avoid a race where
+                # update_chat_ctx resolves the result before the future is registered.
+                fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+                with self._pending_tool_lock:
+                    self._pending_tool_results[call_id] = fut
+                    if self._dedup_enable:
+                        self._pending_tool_by_key[dedup_key] = call_id
+                        self._call_id_to_key[call_id] = dedup_key
+                    self._tool_call_start_ts[call_id] = time.perf_counter()
+
+                # Emit FunctionCall into the generation function stream and wait for
+                # the bridged result via update_chat_ctx(), so tools receive RunContext.
                 self._ensure_generation_open(modalities=["text"])  # type: ignore[arg-type]
                 if self._gen_func_q is not None:
                     fnc = llm.FunctionCall(
@@ -644,15 +656,6 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                 else:
                     logger.warning("function queue is not available when invoking tool '%s'", tool_name)
 
-                # Wait for the corresponding FunctionCallOutput delivered via update_chat_ctx
-                fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
-                with self._pending_tool_lock:
-                    self._pending_tool_results[call_id] = fut
-                    if self._dedup_enable:
-                        self._pending_tool_by_key[dedup_key] = call_id
-                        self._call_id_to_key[call_id] = dedup_key
-                    self._tool_call_start_ts[call_id] = time.perf_counter()
-
                 try:
                     result_obj = fut.result(timeout=self._tool_timeout_s)
                     result_obj = _to_json_safe(result_obj)
@@ -663,15 +666,6 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                         result_obj,
                     )
                     return result_obj
-                except Exception as e:
-                    # Propagate structured error to provider instead of generic bridging failure
-                    logger.error(
-                        "client tool '%s' raised bridged error (call_id=%s): %s",
-                        tool_name,
-                        call_id,
-                        e,
-                    )
-                    return {"error": str(e), "call_id": call_id}
                 except concurrent.futures.TimeoutError:
                     # give a small grace window to catch very late results
                     try:
@@ -693,7 +687,16 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                             self._pending_tool_by_key.pop(key, None)
                         self._tool_call_start_ts.pop(call_id, None)
                     logger.error("tool '%s' timed out waiting for result (call_id=%s)", tool_name, call_id)
-                    return {"error": "tool execution timed out"}
+                    return "error: tool execution timed out"
+                except Exception as e:
+                    # Propagate structured error to provider instead of generic bridging failure
+                    logger.error(
+                        "client tool '%s' raised bridged error (call_id=%s): %s",
+                        tool_name,
+                        call_id,
+                        e,
+                    )
+                    return f"error: {str(e)} (call_id={call_id})"
             except Exception:
                 logger.exception(
                     "error while bridging tool '%s' invocation (call_id=%s)", tool_name, call_id
