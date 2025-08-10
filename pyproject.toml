@@ -1,3 +1,7 @@
+[project]
+name = "vyvoj25_framework"
+version = "1.0.0"
+
 [tool.uv]
 constraint-dependencies = ['onnxruntime<1.20.0; python_version == "3.9"']
 
