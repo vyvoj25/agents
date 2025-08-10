@@ -768,26 +768,30 @@ class RealtimeSession(llm.RealtimeSession[Any]):
 
         msg_id = str(uuid.uuid4())
 
+        q_audio = self._gen_audio_q
+        q_text = self._gen_text_q
+        q_func = self._gen_func_q
+
         async def _audio_iter():
-            assert self._gen_audio_q is not None
+            assert q_audio is not None
             while True:
-                item = await self._gen_audio_q.get()
+                item = await q_audio.get()
                 if item is None:  # type: ignore[comparison-overlap]
                     break
                 yield item
 
         async def _text_iter():
-            assert self._gen_text_q is not None
+            assert q_text is not None
             while True:
-                item = await self._gen_text_q.get()
+                item = await q_text.get()
                 if item is None:  # type: ignore[comparison-overlap]
                     break
                 yield item
 
         async def _func_iter():
-            assert self._gen_func_q is not None
+            assert q_func is not None
             while True:
-                item = await self._gen_func_q.get()
+                item = await q_func.get()
                 if item is None:  # type: ignore[comparison-overlap]
                     break
                 yield item
@@ -840,11 +844,6 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         self._gen_audio_q = None
         self._gen_text_q = None
         self._gen_func_q = None
-        # Reset for next generation
-        self._gen_audio_q = None
-        self._gen_text_q = None
-        self._gen_func_q = None
-        self._gen_close_sent = False
 
 
 # ---- Audio Interface adapter ----
