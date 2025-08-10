@@ -373,6 +373,17 @@ async def _execute_tools_task(
     from .events import RunContext
 
     def _tool_completed(out: ToolExecutionOutput) -> None:
+        # Trace when the tool completion callback is invoked
+        try:
+            logger.debug(
+                "tool completed; invoking completion callback",
+                extra={
+                    "function": out.fnc_call.name,
+                    "speech_id": speech_handle.id,
+                },
+            )
+        except Exception:
+            pass
         tool_execution_completed_cb(out)
         tool_output.output.append(out)
 
@@ -533,6 +544,16 @@ async def _execute_tools_task(
                         )
 
                     # TODO(theomonnom): Add the agent handoff inside the current_span
+                    try:
+                        logger.debug(
+                            "tool finished; scheduling _tool_completed",
+                            extra={
+                                "function": fnc_call.name,
+                                "speech_id": speech_handle.id,
+                            },
+                        )
+                    except Exception:
+                        pass
                     _tool_completed(output)
 
                 task = asyncio.create_task(_traceable_fnc_tool(function_callable, fnc_call))

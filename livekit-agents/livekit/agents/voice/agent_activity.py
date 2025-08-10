@@ -1558,6 +1558,25 @@ class AgentActivity(RecognitionHooks):
         def _tool_execution_completed_cb(out: ToolExecutionOutput) -> None:
             if out.fnc_call_out:
                 speech_handle._item_added([out.fnc_call_out])
+                # Forward tool result immediately to realtime session to unblock plugin waiters
+                if self._rt_session is not None:
+                    try:
+                        logger.debug(
+                            "immediate tool forwarding (call_id=%s, name=%s)",
+                            out.fnc_call_out.call_id,
+                            out.fnc_call_out.name,
+                        )
+                    except Exception:
+                        # best-effort logging
+                        pass
+                    try:
+                        chat_ctx = self._rt_session.chat_ctx.copy()
+                        chat_ctx.items.append(out.fnc_call_out)
+                        asyncio.create_task(self._rt_session.update_chat_ctx(chat_ctx))
+                    except Exception:
+                        logger.exception("failed to incrementally update chat context with tool output")
+                else:
+                    logger.debug("immediate tool forwarding skipped: rt_session is None")
 
         # start to execute tools (only after play())
         exe_task, tool_output = perform_tool_executions(
@@ -1928,6 +1947,14 @@ class AgentActivity(RecognitionHooks):
         def _tool_execution_completed_cb(out: ToolExecutionOutput) -> None:
             if out.fnc_call_out:
                 speech_handle._item_added([out.fnc_call_out])
+                # Forward tool result immediately to realtime session to unblock plugin waiters
+                if self._rt_session is not None:
+                    try:
+                        chat_ctx = self._rt_session.chat_ctx.copy()
+                        chat_ctx.items.append(out.fnc_call_out)
+                        asyncio.create_task(self._rt_session.update_chat_ctx(chat_ctx))
+                    except Exception:
+                        logger.exception("failed to incrementally update chat context with tool output")
 
         exe_task, tool_output = perform_tool_executions(
             session=self._session,

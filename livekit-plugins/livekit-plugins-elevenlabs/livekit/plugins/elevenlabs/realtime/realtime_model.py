@@ -539,6 +539,18 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                 return obj
             return str(obj)
 
+        def _to_provider_result(obj: Any) -> str:
+            """Return a plain string result for the provider.
+            ElevenLabs may expect tool results as strings; convert any object accordingly.
+            """
+            if isinstance(obj, str):
+                return obj
+            try:
+                # Prefer JSON text representation to preserve structure
+                return json.dumps(obj, ensure_ascii=False)
+            except Exception:
+                return str(obj)
+
         def _call_tool_sync(params: dict[str, Any]) -> Any:
             # NOTE: We do NOT execute the tool here. We bridge the provider's tool call
             # to LiveKit's AgentActivity by emitting a FunctionCall into the function stream
@@ -586,8 +598,8 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                                     elapsed = time.perf_counter() - existing_started
                                     remaining = max(0.1, self._tool_timeout_s - elapsed)
                                 result_obj = existing_fut.result(timeout=remaining)
-                                # ensure JSON-safety for provider
-                                result_obj = _to_json_safe(result_obj)
+                                # ensure provider-friendly string
+                                result_obj = _to_provider_result(_to_json_safe(result_obj))
                                 logger.debug(
                                     "duplicate tool '%s' returning bridged result from existing (call_id=%s)",
                                     tool_name,
@@ -598,7 +610,7 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                                 # final grace window to catch very late resolutions
                                 try:
                                     result_obj = existing_fut.result(timeout=self._tool_timeout_grace_s)
-                                    result_obj = _to_json_safe(result_obj)
+                                    result_obj = _to_provider_result(_to_json_safe(result_obj))
                                     logger.debug(
                                         "duplicate tool '%s' received result in grace window (call_id=%s)",
                                         tool_name,
@@ -658,7 +670,7 @@ class RealtimeSession(llm.RealtimeSession[Any]):
 
                 try:
                     result_obj = fut.result(timeout=self._tool_timeout_s)
-                    result_obj = _to_json_safe(result_obj)
+                    result_obj = _to_provider_result(_to_json_safe(result_obj))
                     logger.debug(
                         "client tool '%s' completed (call_id=%s) with bridged result: %s",
                         tool_name,
@@ -670,7 +682,7 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                     # give a small grace window to catch very late results
                     try:
                         result_obj = fut.result(timeout=self._tool_timeout_grace_s)
-                        result_obj = _to_json_safe(result_obj)
+                        result_obj = _to_provider_result(_to_json_safe(result_obj))
                         logger.debug(
                             "client tool '%s' received result in grace window (call_id=%s): %s",
                             tool_name,
