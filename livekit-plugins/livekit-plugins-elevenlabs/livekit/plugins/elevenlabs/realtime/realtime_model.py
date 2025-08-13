@@ -107,6 +107,8 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         # Placeholders for upcoming SDK objects
         self._conversation = None  # type: ignore[var-annotated]
         self._audio_task: asyncio.Task[None] | None = None
+        # Prevent re-starts after an explicit end_conversation()
+        self._ended: bool = False
 
         # ElevenLabs SDK objects
         self._client = None  # type: ignore[var-annotated]
@@ -337,8 +339,11 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         # that resolves when the next generation is created.
         if self._pending_generation_fut is None or self._pending_generation_fut.done():
             self._pending_generation_fut = self._loop.create_future()
-        # Ensure session is started
-        self._ensure_started()
+        # Ensure session is started unless explicitly ended
+        if not self._ended:
+            self._ensure_started()
+        else:
+            logger.debug("generate_reply called after end_conversation; suppressing session start")
         return self._pending_generation_fut
 
     def commit_audio(self) -> None:
@@ -361,8 +366,24 @@ class RealtimeSession(llm.RealtimeSession[Any]):
         audio_end_ms: int,
         audio_transcript: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:  # noqa: ARG002
-        # TODO: emulate by restarting conversation / updating context
-        raise NotImplementedError("truncate not implemented for ElevenLabs yet")
+        # ElevenLabs handles VAD/turn-taking; no explicit truncate needed
+        pass
+
+    def end_conversation(self) -> None:
+        """
+        Gracefully end the underlying ElevenLabs conversation session without
+        closing this LiveKit RealtimeSession. A new conversation will be
+        created automatically on next audio via _ensure_started().
+        """
+        try:
+            if self._conversation is not None:
+                self._conversation.end_session()
+        except Exception:
+            logger.exception("error while ending ElevenLabs conversation session")
+        finally:
+            # Mark as explicitly ended and ensure local teardown mirrors SDK callback behavior
+            self._ended = True
+            self._on_sdk_end_session()
 
     async def aclose(self) -> None:
         if self._closed:
@@ -391,6 +412,9 @@ class RealtimeSession(llm.RealtimeSession[Any]):
     # ---- Internal helpers ----
     def _ensure_started(self) -> None:
         if self._conversation is not None:
+            return
+        if self._ended:
+            logger.debug("suppressing ElevenLabs session restart after end_conversation")
             return
 
         # Lazy imports to avoid hard dependency if not used
@@ -756,6 +780,13 @@ class RealtimeSession(llm.RealtimeSession[Any]):
     def _on_sdk_end_session(self) -> None:
         # Conversation ended
         self._close_active_generation()
+        try:
+            if self._audio_if is not None:
+                self._audio_if.stop()
+        except Exception:
+            logger.exception("error while stopping audio interface on session end")
+        # Allow a new conversation to be created on next activity
+        self._conversation = None
 
     def _ensure_generation_open(self, *, modalities: list[str]) -> None:
         if self._gen_audio_q is not None and self._gen_text_q is not None and self._gen_func_q is not None:
@@ -796,16 +827,23 @@ class RealtimeSession(llm.RealtimeSession[Any]):
                     break
                 yield item
 
-        async def _modalities() -> list[Literal["text", "audio"]]:
-            # If we received any text, both will be present; otherwise audio-only
-            return [m for m in ["text" if "text" in modalities else None, "audio"] if m]  # type: ignore[list-item]
+        # Compute modalities now and expose as a reusable awaitable (Future) so
+        # it can be awaited multiple times safely by the consumer.
+        mods: list[Literal["text", "audio"]]
+        if "text" in modalities:
+            mods = ["text", "audio"]
+        else:
+            mods = ["audio"]
+        mods_future: asyncio.Future[list[Literal["text", "audio"]]] = self._loop.create_future()
+        if not mods_future.done():
+            mods_future.set_result(mods)
 
         async def _one_message():
             yield llm.MessageGeneration(
                 message_id=msg_id,
                 text_stream=_text_iter(),
                 audio_stream=_audio_iter(),
-                modalities=_modalities(),
+                modalities=mods_future,
             )
 
         async def _function_stream():
