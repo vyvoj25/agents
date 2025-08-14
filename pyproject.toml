@@ -1,4 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project]
 name = "vyvoj25_framework"
-version = "1.0.6" 
-dependencies = []
+version = "1.0.8"
+description = "Bundled LiveKit agents and plugins fork for vyvoj25. Installs top-level 'livekit' package."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "vyvoj25" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "click~=8.1",
+  "livekit>=1.0.12,<2",
+  "livekit-api>=1.0.4,<2",
+  "livekit-protocol~=1.0",
+  "livekit-blingfire~=1.0",
+  "protobuf>=3",
+  "pyjwt>=2.0",
+  "types-protobuf>=4,<5",
+  "watchfiles>=1.0",
+  "psutil>=7.0",
+  "aiohttp~=3.10",
+  "typing-extensions>=4.12",
+  "sounddevice>=0.5",
+  "docstring_parser>=0.16",
+  "eval-type-backport",
+  "colorama>=0.4.6",
+  "av>=14.0.0",
+  "numpy>=1.26.0",
+  "pydantic>=2.0,<3",
+  "nest-asyncio>=1.6.0",
+  "opentelemetry-api>=1.34",
+  "opentelemetry-sdk>=1.34.1",
+  "opentelemetry-exporter-otlp>=1.34.1",
+  "prometheus-client>=0.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/vyvoj25/livekit_agents_framework"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "vyvoj25_framework/livekit"
+]
+include = [
+  "vyvoj25_framework/livekit/**/resources/**",
+  "vyvoj25_framework/livekit/agents/debug/index.html"
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["/vyvoj25_framework"]

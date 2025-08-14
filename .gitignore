@@ -171,5 +171,12 @@ credentials.json
 pyrightconfig.json
 docs/
 
+# Local build output for namespaced fork
+vyvoj25_fork_build/
+
+# Local test virtualenvs
+.venv-test
+.venv-test-ns
+
 # Database files
 *.db
