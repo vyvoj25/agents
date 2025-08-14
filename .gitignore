@@ -173,6 +173,7 @@ docs/
 
 # Local build output for namespaced fork
 vyvoj25_fork_build/
+vyvoj25_framework/
 
 # Local test virtualenvs
 .venv-test
@@ -180,3 +181,6 @@ vyvoj25_fork_build/
 
 # Database files
 *.db
+
+# Backup files
+backups

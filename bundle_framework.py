@@ -25,15 +25,45 @@ def _read_version_from_pyproject() -> str:
 
 
 def copy_agents(base_pkg_dir: Path):
-    agents_src = ROOT / "livekit-agents" / "livekit" / "agents"
+    default_src = ROOT / "livekit-agents" / "livekit" / "agents"
     agents_dst = base_pkg_dir / "agents"
-    if not agents_src.exists():
-        raise FileNotFoundError(f"Agents source not found: {agents_src}")
+    agents_src = default_src
+    if not default_src.exists():
+        # Search for nested layouts, e.g. monorepo variants that still contain
+        # a Python package at some/*/livekit/agents
+        candidates = []
+        la_root = ROOT / "livekit-agents"
+        if la_root.exists():
+            for p in la_root.rglob("livekit/agents"):
+                s = str(p)
+                # Skip generated or irrelevant paths
+                if any(x in s for x in ("vyvoj25_fork_build", "overlay", "dist", "build")):
+                    continue
+                candidates.append(p)
+        if candidates:
+            # Prefer the shortest path (closest to la_root)
+            agents_src = sorted(candidates, key=lambda x: len(x.as_posix()))[0]
+            print(f"🔍 Using discovered agents source: {agents_src}")
+        else:
+            raise FileNotFoundError(
+                f"Agents source not found at {default_src} and no nested 'livekit/agents' found under {la_root}"
+            )
     shutil.copytree(agents_src, agents_dst)
 
 
 def copy_plugins(base_pkg_dir: Path):
     plugins_root = ROOT / "livekit-plugins"
+    # Fallback: when upstream is tracked as a single monorepo submodule at
+    # ROOT/livekit-agents, plugins live under livekit-agents/livekit-plugins
+    if not plugins_root.exists():
+        alt = ROOT / "livekit-agents" / "livekit-plugins"
+        if alt.exists():
+            plugins_root = alt
+        else:
+            raise FileNotFoundError(
+                f"Plugins source not found: {ROOT / 'livekit-plugins'} or {alt}"
+            )
+
     plugins_dst_root = base_pkg_dir / "plugins"
     plugins_dst_root.mkdir(parents=True, exist_ok=True)
 
@@ -50,6 +80,52 @@ def copy_plugins(base_pkg_dir: Path):
         dst_path = plugins_dst_root / plugin_name
         shutil.copytree(src_path, dst_path)
         print(f"✅ Copied plugin: {plugin_name}")
+
+
+def _merge_dir(src: Path, dst: Path) -> None:
+    """Recursively copy files from src into dst, overwriting existing files.
+
+    Creates directories as needed. Similar to an rsync overlay.
+    """
+    if not src.exists():
+        return
+    for root, dirs, files in os.walk(src):
+        rel = Path(root).relative_to(src)
+        target_dir = dst / rel
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for fname in files:
+            shutil.copy2(Path(root) / fname, target_dir / fname)
+
+
+def apply_overlay(base_pkg_dir: Path) -> None:
+    """Apply overlay/ files on top of the copied sources.
+
+    Expected structure under `overlay/` mirrors livekit subpackages:
+      - overlay/agents/** -> {base_pkg_dir}/agents/**
+      - overlay/plugins/** -> {base_pkg_dir}/plugins/**
+      - overlay/<subpkg>/** for other subpackages (llm, voice, etc.)
+    """
+    overlay_root = ROOT / "overlay"
+    if not overlay_root.exists():
+        return
+    subdirs = [
+        "agents",
+        "plugins",
+        "llm",
+        "metrics",
+        "stt",
+        "tokenize",
+        "tts",
+        "utils",
+        "vad",
+        "voice",
+        "ipc",
+    ]
+    for sub in subdirs:
+        src = overlay_root / sub
+        if src.exists():
+            _merge_dir(src, base_pkg_dir / sub)
+    print("🧩 Applied overlay on top of upstream sources")
 
 
 def _rewrite_imports_to_namespace(ns_root: Path, new_top: str = "vyvoj25_fork") -> None:
@@ -105,6 +181,9 @@ def main():
         # Copy sources into namespaced package
         copy_agents(base_pkg_dir)
         copy_plugins(base_pkg_dir)
+
+        # Apply any user overrides from overlay/
+        apply_overlay(base_pkg_dir)
 
         # Rewrite absolute imports from 'livekit' -> 'vyvoj25_fork'
         _rewrite_imports_to_namespace(base_pkg_dir, new_top="vyvoj25_fork")
@@ -197,6 +276,8 @@ include = ["/vyvoj25_fork"]
         # Copy code
         copy_agents(TARGET / "livekit")
         copy_plugins(TARGET / "livekit")
+        # Apply overlay (same layout under overlay/)
+        apply_overlay(TARGET / "livekit")
         print("🎉 Framework bundling completed! (import as 'livekit.*')")
 
 

@@ -8,7 +8,8 @@ DIST_DIR := dist
 NS_BUILD_DIR := vyvoj25_fork_build
 
 .PHONY: all deps bundle build check clean upload upload-test release test-release print-version test-install \
-        bundle-ns build-ns check-ns upload-ns release-ns test-install-ns clean-ns
+        bundle-ns build-ns check-ns upload-ns release-ns test-install-ns clean-ns \
+        submodules-init submodules-update submodules-checkout submodules-status overlay-ls
 
 all: release
 
@@ -107,3 +108,22 @@ test-install-ns:
 	python -m pip install $(NS_BUILD_DIR)/dist/*.whl  # namespaced fork
 	python -c "import livekit.agents, vyvoj25_fork.agents; print('upstream agents at:', livekit.agents.__file__); print('fork agents at:', vyvoj25_fork.agents.__file__)"
 	deactivate
+
+# --- Git submodules helpers (track upstream repos cleanly) ---
+submodules-init:
+	git submodule update --init --recursive
+
+submodules-update:
+	git submodule foreach 'git fetch --tags --prune && git pull --ff-only || true'
+
+# Usage: make submodules-checkout TAG=vX.Y.Z  (or a commit SHA)
+submodules-checkout:
+	@if [ -z "$(TAG)" ]; then echo "Usage: make submodules-checkout TAG=<tag-or-commit>"; exit 1; fi
+	git submodule foreach 'git checkout $(TAG)'
+
+submodules-status:
+	git submodule status --recursive
+
+# Inspect overlay contents
+overlay-ls:
+	@if [ -d overlay ]; then find overlay -type f | sort; else echo "overlay/ (empty)"; fi
